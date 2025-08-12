@@ -1,8 +1,8 @@
-import { useRef, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import Tesseract from 'tesseract.js';
 
-// eslint-disable-next-line @typescript-eslint/no-explicit-any
-declare const cv: any;
+interface Region { left: number; top: number; width: number; height: number; }
+interface WindowInfo { title: string; region: Region; }
 
 function normalize(str: string) {
   return str
@@ -11,129 +11,153 @@ function normalize(str: string) {
     .replace(/[^\w\u4e00-\u9fff・]/g, '')
     .trim();
 }
-
-function fuzzyMatch(input: string, expectedList: string[]): string | null {
-  const threshold = 0.7;
-  let bestMatch = null;
-  let maxSimilarity = 0;
-
-  for (const target of expectedList) {
-    const a = normalize(input);
-    const b = normalize(target);
-    const distance = levenshtein(a, b);
-    const maxLen = Math.max(a.length, b.length);
-    const similarity = (maxLen - distance) / maxLen;
-    if (similarity > threshold && similarity > maxSimilarity) {
-      bestMatch = target;
-      maxSimilarity = similarity;
-    }
-  }
-  return bestMatch;
-}
-
-function levenshtein(a: string, b: string): number {
+function levenshtein(a: string, b: string) {
   const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
   for (let i = 0; i <= a.length; i++) dp[i][0] = i;
   for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) {
-    for (let j = 1; j <= b.length; j++) {
-      if (a[i - 1] === b[j - 1]) {
-        dp[i][j] = dp[i - 1][j - 1];
-      } else {
-        dp[i][j] = 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-      }
-    }
-  }
+  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
+    dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
   return dp[a.length][b.length];
+}
+function fuzzyMatch(input: string, expectedList: string[], threshold = 0.7): string | null {
+  let best: string | null = null, bestScore = 0;
+  for (const t of expectedList) {
+    const a = normalize(input), b = normalize(t);
+    const maxLen = Math.max(a.length, b.length) || 1;
+    const score = (maxLen - levenshtein(a, b)) / maxLen;
+    if (score >= threshold && score > bestScore) { best = t; bestScore = score; }
+  }
+  return best;
 }
 
 export default function App() {
-  const [idList, setIdList] = useState<string[]>([]);
-  const [preview, setPreview] = useState<string | null>(null);
-  const canvasRef = useRef<HTMLCanvasElement>(null);
-
+  const [wins, setWins] = useState<WindowInfo[]>([]);
+  const [selected, setSelected] = useState<WindowInfo | null>(null);
+  const [saveDir, setSaveDir] = useState<string | null>(null);
+  const [shot, setShot] = useState<string | null>(null);
+  const [ocrText, setOcrText] = useState<string>('');
   const [expectedInput, setExpectedInput] = useState<string>('');
-  const expectedList = expectedInput.split('\n').map(line => line.trim()).filter(Boolean);
-  // const expectedList = [
-  //   'Mermaidx', 'SilverSS', '順吉吉', 'T1・Zeus', 'T1・愛夜鴉愛娛美德',
-  //   'T1・Faker', '黎明使者索拉卡', '姐姐也會仰式嗎', '天曈'
-  // ];
 
-  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
+  const expectedList = useMemo(
+    () => expectedInput.split('\n').map(s => s.trim()).filter(Boolean),
+    [expectedInput]
+  );
 
-    const url = URL.createObjectURL(file);
-    setPreview(url);
-
-    const img = new Image();
-    img.src = url;
-    img.onload = async () => {
-      const src = cv.imread(img);
-      const roi = src.roi(new cv.Rect(35, 0, 350, src.rows));
-      const gray = new cv.Mat();
-      cv.cvtColor(roi, gray, cv.COLOR_RGBA2GRAY);
-
-      // cv.equalizeHist(gray, gray);
-      cv.threshold(gray, gray, 100, 255, cv.THRESH_BINARY);
-
-      if (canvasRef.current) cv.imshow(canvasRef.current, gray);
-
-      const tempCanvas = document.createElement('canvas');
-      tempCanvas.width = gray.cols;
-      tempCanvas.height = gray.rows;
-      cv.imshow(tempCanvas, gray);
-
-      tempCanvas.toBlob(async (blob) => {
-        if (!blob) return;
-        const result = await Tesseract.recognize(blob, 'chi_tra+eng', {
-          langPath: 'https://tessdata.projectnaptha.com/4.0.0',
-        });
-        const rawText = result.data.text;
-        const lines = rawText.split('\n').map(line => line.trim()).filter(Boolean);
-        setIdList(lines);
-
-        src.delete();
-        roi.delete();
-        gray.delete();
-      });
-    };
+  const fetchWins = async () => {
+    const res = await window.electronAPI.listNightcrowsWindows();
+    if (res.success && res.windows) setWins(res.windows);
+    else alert(res.error ?? '找不到 NIGHT CROWS 視窗');
   };
 
-  const normExpected = expectedList.map(normalize);
-  const normActual = idList.map(normalize);
+  useEffect(() => { fetchWins(); }, []);
 
-  const matched = expectedList.filter((id, idx) => normActual.includes(normExpected[idx]));
-  const notFound = expectedList.filter((id, idx) => !normActual.includes(normExpected[idx]) && !idList.some(actual => fuzzyMatch(actual, [id])));
-  const unexpected = idList.filter((id) => {
-    const norm = normalize(id);
-    return !normExpected.includes(norm) && !fuzzyMatch(id, expectedList);
+  const chooseFolder = async () => {
+    const r = await window.electronAPI.chooseSaveFolder();
+    if (r.success && r.path) setSaveDir(r.path); else alert(r.error ?? '尚未選擇資料夾');
+  };
+
+  const focusSelected = async () => {
+    if (!selected) return alert('請先選擇視窗');
+    const r = await window.electronAPI.bringWindowToFront(selected.region);
+    if (!r.success) alert(r.error ?? '切換視窗失敗');
+  };
+
+  const captureSelected = async () => {
+    if (!selected) return alert('請先選擇視窗');
+    if (!saveDir) return alert('請先選擇儲存資料夾');
+    const r = await window.electronAPI.screenshotWindow(selected.region, saveDir);
+    if (r.success && r.dataUrl) setShot(r.dataUrl); else alert(r.error ?? '擷取失敗');
+  };
+
+  const runOCR = async () => {
+    if (!shot) return alert('先擷取畫面');
+    const res = await Tesseract.recognize(shot, 'chi_tra+eng', {
+      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
+    });
+    setOcrText(res.data.text || '');
+  };
+
+  // 解析 OCR 文本為一行一個 ID
+  const ocrList = useMemo(() =>
+    ocrText.split('\n').map(s => s.trim()).filter(Boolean), [ocrText]
+  );
+
+  // 比對
+  const normExpected = expectedList.map(normalize);
+  const normActual = ocrList.map(normalize);
+
+  const matched = expectedList.filter((id) =>
+    normActual.includes(normalize(id)) || !!fuzzyMatch(id, ocrList));
+
+  const notFound = expectedList.filter((id) =>
+    !normActual.includes(normalize(id)) && !fuzzyMatch(id, ocrList));
+
+  const unexpected = ocrList.filter((id) => {
+    const n = normalize(id);
+    if (normExpected.includes(n)) return false;
+    return !fuzzyMatch(id, expectedList);
   });
 
   return (
-    <div>
-      <h1>📋 擷取遊戲人員 ID（加入模糊比對）</h1>
-      <textarea
-        value={expectedInput}
-        onChange={e => setExpectedInput(e.target.value)}
-        rows={10}
-        placeholder="請貼上 ID 清單，每行一個"
-        style={{ width: '100%', marginBottom: '1rem' }}
-      />
-      <input type="file" accept="image/*" onChange={handleImageUpload} />
-      {preview && <img src={preview} alt="preview" style={{ maxWidth: 400 }} />}
+    <div style={{ padding: 16, display: 'grid', gap: 12 }}>
+      <h2>NIGHT CROWS 擷取 + OCR + 比對</h2>
 
-      <h2>處理後圖像：</h2>
-      <canvas ref={canvasRef} style={{ border: '1px solid #ccc', maxWidth: 400 }} />
+      <div>
+        <button onClick={fetchWins}>🔎 掃描 NIGHT CROWS 視窗</button>
+      </div>
 
-      <h2>✔️ 有成功比對的 ID</h2>
-      <ul>{expectedList.filter(id => normActual.includes(normalize(id)) || idList.some(actual => fuzzyMatch(actual, [id]))).map((id, i) => <li key={i}>{id}</li>)}</ul>
+      <div>
+        <strong>偵測到的視窗：</strong>
+        <ul>
+          {wins.map((w, i) => (
+            <li key={`${w.title}-${w.region.left}-${w.region.top}-${i}`}>
+              <button onClick={() => setSelected(w)}>
+                {w.title} — {w.region.width}×{w.region.height} @ ({w.region.left},{w.region.top})
+              </button>
+            </li>
+          ))}
+        </ul>
+      </div>
 
-      <h2>❌ 缺少的 ID（沒被擷取出來）</h2>
-      <ul>{notFound.map((id, i) => <li key={i}>{id}</li>)}</ul>
+      <div>
+        <button onClick={focusSelected}>🪄 聚焦選中的視窗</button>
+      </div>
 
-      <h2>⚠️ 意外出現的 ID（未在清單內）</h2>
-      <ul>{unexpected.map((id, i) => <li key={i}>{id}</li>)}</ul>
+      <div>
+        <button onClick={chooseFolder}>📂 選擇儲存資料夾</button>
+        <div>目前儲存位置：{saveDir ?? '（尚未設定）'}</div>
+      </div>
+
+      <div>
+        <button onClick={captureSelected}>📸 擷取該視窗</button>
+        {shot && <div style={{ marginTop: 8 }}><img src={shot} alt="shot" style={{ maxWidth: 600, border: '1px solid #ddd' }} /></div>}
+      </div>
+
+      <div>
+        <textarea
+          value={expectedInput}
+          onChange={e => setExpectedInput(e.target.value)}
+          rows={8}
+          placeholder="在這裡貼你的名單，每行一個 ID"
+          style={{ width: '100%' }}
+        />
+      </div>
+
+      <div>
+        <button onClick={runOCR}>🔠 OCR（繁中+英）</button>
+        <pre style={{ whiteSpace: 'pre-wrap', background: '#f7f7f7', padding: 8 }}>{ocrText}</pre>
+      </div>
+
+      <div>
+        <h3>✔️ 有成功比對的 ID</h3>
+        <ul>{matched.map((id, i) => <li key={i}>{id}</li>)}</ul>
+
+        <h3>❌ 缺少的 ID（沒被擷取出來）</h3>
+        <ul>{notFound.map((id, i) => <li key={i}>{id}</li>)}</ul>
+
+        <h3>⚠️ 意外出現的 ID（未在清單內）</h3>
+        <ul>{unexpected.map((id, i) => <li key={i}>{id}</li>)}</ul>
+      </div>
     </div>
   );
 }
