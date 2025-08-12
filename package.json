@@ -6,6 +6,8 @@
   "scripts": {
     "dev": "concurrently \"vite\" \"wait-on http://localhost:5173 && electron electron/main.js\"",
     "build": "tsc -b && vite build",
+    "start": "electron .",
+    "rebuild": "electron-rebuild -f -w @nut-tree-fork/libnut",
     "nocheck:build": "vite build",
     "dist": "electron-builder",
     "lint": "eslint .",

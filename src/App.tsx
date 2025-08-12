@@ -1,163 +1,208 @@
-import { useEffect, useMemo, useState } from 'react';
-import Tesseract from 'tesseract.js';
+import { useEffect, useRef, useState } from 'react'
+import { similarity, normalize } from './fuzzy.tsx'
+import { ocrImageData } from './orc.tsx'
+import './style.css'
 
-interface Region { left: number; top: number; width: number; height: number; }
-interface WindowInfo { title: string; region: Region; }
-
-function normalize(str: string) {
-  return str
-    .replace(/\s+/g, '')
-    .replace(/[‧・．·･·]/g, '・')
-    .replace(/[^\w\u4e00-\u9fff・]/g, '')
-    .trim();
-}
-function levenshtein(a: string, b: string) {
-  const dp = Array.from({ length: a.length + 1 }, () => Array(b.length + 1).fill(0));
-  for (let i = 0; i <= a.length; i++) dp[i][0] = i;
-  for (let j = 0; j <= b.length; j++) dp[0][j] = j;
-  for (let i = 1; i <= a.length; i++) for (let j = 1; j <= b.length; j++)
-    dp[i][j] = a[i - 1] === b[j - 1] ? dp[i - 1][j - 1] : 1 + Math.min(dp[i - 1][j], dp[i][j - 1], dp[i - 1][j - 1]);
-  return dp[a.length][b.length];
-}
-function fuzzyMatch(input: string, expectedList: string[], threshold = 0.7): string | null {
-  let best: string | null = null, bestScore = 0;
-  for (const t of expectedList) {
-    const a = normalize(input), b = normalize(t);
-    const maxLen = Math.max(a.length, b.length) || 1;
-    const score = (maxLen - levenshtein(a, b)) / maxLen;
-    if (score >= threshold && score > bestScore) { best = t; bestScore = score; }
-  }
-  return best;
+interface SourceLite {
+  id: string
+  name: string
+  thumbnailDataURL: string
 }
 
 export default function App() {
-  const [wins, setWins] = useState<WindowInfo[]>([]);
-  const [selected, setSelected] = useState<WindowInfo | null>(null);
-  const [saveDir, setSaveDir] = useState<string | null>(null);
-  const [shot, setShot] = useState<string | null>(null);
-  const [ocrText, setOcrText] = useState<string>('');
-  const [expectedInput, setExpectedInput] = useState<string>('');
+  const [sources, setSources] = useState<SourceLite[]>([])
+  const [selected, setSelected] = useState<SourceLite | null>(null)
+  const videoRef = useRef<HTMLVideoElement | null>(null)
+  const [stream, setStream] = useState<MediaStream | null>(null)
 
-  const expectedList = useMemo(
-    () => expectedInput.split('\n').map(s => s.trim()).filter(Boolean),
-    [expectedInput]
-  );
+  // 選取區域（以 video 的 CSS 尺寸為座標系）
+  const [dragging, setDragging] = useState(false)
+  const [rect, setRect] = useState<{ x: number, y: number, w: number, h: number }>({ x: 0, y: 0, w: 0, h: 0 })
+  const containerRef = useRef<HTMLDivElement | null>(null)
 
-  const fetchWins = async () => {
-    const res = await window.electronAPI.listNightcrowsWindows();
-    if (res.success && res.windows) setWins(res.windows);
-    else alert(res.error ?? '找不到 NIGHT CROWS 視窗');
-  };
+  const [namesText, setNamesText] = useState('Alice\nBob\nCharlie')
+  const [threshold, setThreshold] = useState(0.82)
+  const [ocrText, setOcrText] = useState('')
+  const [matches, setMatches] = useState<{ name: string; best: string; score: number }[]>([])
 
-  useEffect(() => { fetchWins(); }, []);
+  useEffect(() => {
+    return () => {
+      if (stream) stream.getTracks().forEach(t => t.stop())
+    }
+  }, [stream])
 
-  const chooseFolder = async () => {
-    const r = await window.electronAPI.chooseSaveFolder();
-    if (r.success && r.path) setSaveDir(r.path); else alert(r.error ?? '尚未選擇資料夾');
-  };
+  async function listNightCrows() {
+    const raw = await desktopCapturer.getSources({ types: ['window'], fetchWindowIcons: true, thumbnailSize: { width: 320, height: 180 } })
+    const filtered = raw.filter(s => /night\s*crows/i.test(s.name))
+    const out: SourceLite[] = filtered.map(s => ({
+      id: s.id,
+      name: s.name,
+      thumbnailDataURL: s.thumbnail.toDataURL()
+    }))
+    setSources(out)
+  }
 
-  const focusSelected = async () => {
-    if (!selected) return alert('請先選擇視窗');
-    const r = await window.electronAPI.bringWindowToFront(selected.region);
-    if (!r.success) alert(r.error ?? '切換視窗失敗');
-  };
+  async function startPreview(source: SourceLite) {
+    // 關閉舊串流
+    if (stream) stream.getTracks().forEach(t => t.stop())
 
-  const captureSelected = async () => {
-    if (!selected) return alert('請先選擇視窗');
-    if (!saveDir) return alert('請先選擇儲存資料夾');
-    const r = await window.electronAPI.screenshotWindow(selected.region, saveDir);
-    if (r.success && r.dataUrl) setShot(r.dataUrl); else alert(r.error ?? '擷取失敗');
-  };
+    const newStream = await (navigator.mediaDevices as any).getUserMedia({
+      audio: false,
+      video: {
+        mandatory: {
+          chromeMediaSource: 'desktop',
+          chromeMediaSourceId: source.id
+        }
+      }
+    })
+    setSelected(source)
+    setStream(newStream)
+    if (videoRef.current) {
+      videoRef.current.srcObject = newStream
+      await videoRef.current.play()
+    }
+  }
 
-  const runOCR = async () => {
-    if (!shot) return alert('先擷取畫面');
-    const res = await Tesseract.recognize(shot, 'chi_tra+eng', {
-      langPath: 'https://tessdata.projectnaptha.com/4.0.0',
-    });
-    setOcrText(res.data.text || '');
-  };
+  function onMouseDown(e: React.MouseEvent) {
+    if (!containerRef.current) return
+    const r = containerRef.current.getBoundingClientRect()
+    const x = e.clientX - r.left
+    const y = e.clientY - r.top
+    setRect({ x, y, w: 0, h: 0 })
+    setDragging(true)
+  }
 
-  // 解析 OCR 文本為一行一個 ID
-  const ocrList = useMemo(() =>
-    ocrText.split('\n').map(s => s.trim()).filter(Boolean), [ocrText]
-  );
+  function onMouseMove(e: React.MouseEvent) {
+    if (!dragging || !containerRef.current) return
+    const r = containerRef.current.getBoundingClientRect()
+    const x = e.clientX - r.left
+    const y = e.clientY - r.top
+    setRect(prev => ({ ...prev, w: x - prev.x, h: y - prev.y }))
+  }
 
-  // 比對
-  const normExpected = expectedList.map(normalize);
-  const normActual = ocrList.map(normalize);
+  function onMouseUp() { setDragging(false) }
 
-  const matched = expectedList.filter((id) =>
-    normActual.includes(normalize(id)) || !!fuzzyMatch(id, ocrList));
+  async function captureAndOCR() {
+    if (!videoRef.current) return
+    const video = videoRef.current
+    if (!video.videoWidth || !video.videoHeight) return
 
-  const notFound = expectedList.filter((id) =>
-    !normActual.includes(normalize(id)) && !fuzzyMatch(id, ocrList));
+    // 以 video 內幕尺寸（實際像素）做裁切
+    const scaleX = video.videoWidth / video.clientWidth
+    const scaleY = video.videoHeight / video.clientHeight
 
-  const unexpected = ocrList.filter((id) => {
-    const n = normalize(id);
-    if (normExpected.includes(n)) return false;
-    return !fuzzyMatch(id, expectedList);
-  });
+    const sx = Math.max(0, Math.round((rect.w >= 0 ? rect.x : rect.x + rect.w) * scaleX))
+    const sy = Math.max(0, Math.round((rect.h >= 0 ? rect.y : rect.y + rect.h) * scaleY))
+    const sw = Math.abs(Math.round(rect.w * scaleX))
+    const sh = Math.abs(Math.round(rect.h * scaleY))
+
+    const canvas = document.createElement('canvas')
+    canvas.width = sw
+    canvas.height = sh
+    const ctx = canvas.getContext('2d')!
+    ctx.drawImage(video, sx, sy, sw, sh, 0, 0, sw, sh)
+
+    const imgData = ctx.getImageData(0, 0, sw, sh)
+    const text = (await ocrImageData(imgData)) || ''
+    setOcrText(text)
+
+    // 解析文字成候選名稱（僅英數與 - _ 空白 / 換行）
+    const tokens = text
+      .split(/\n|\r|\s/)
+      .map(t => t.trim())
+      .filter(Boolean)
+      .map(t => t.replace(/[^A-Za-z0-9\-_]/g, ''))
+      .filter(Boolean)
+
+    const want = namesText.split(/\n|\r/).map(s => s.trim()).filter(Boolean)
+
+    const result: { name: string; best: string; score: number }[] = []
+    for (const name of want) {
+      let best = ''
+      let bestScore = 0
+      for (const t of tokens) {
+        const sc = similarity(name, t)
+        if (sc > bestScore) { bestScore = sc; best = t }
+      }
+      if (bestScore >= threshold) {
+        result.push({ name, best, score: Number(bestScore.toFixed(3)) })
+      }
+    }
+    setMatches(result)
+  }
+
+  async function testAutoClick() {
+    // Demo：把滑鼠移到螢幕 (200, 200) 並點擊一次
+    await window.automation.moveMouse(200, 200)
+    await window.automation.click()
+  }
 
   return (
-    <div style={{ padding: 16, display: 'grid', gap: 12 }}>
-      <h2>NIGHT CROWS 擷取 + OCR + 比對</h2>
+    <div className="page">
+      <h1>NIGHT CROWS 輔助工具 v0</h1>
 
-      <div>
-        <button onClick={fetchWins}>🔎 掃描 NIGHT CROWS 視窗</button>
-      </div>
+      <section className="card">
+        <div className="row gap">
+          <button onClick={listNightCrows}>列出 NIGHT CROWS 視窗</button>
+        </div>
+        {sources.length > 0 && (
+          <div className="grid">
+            {sources.map(s => (
+              <div key={s.id} className={`source ${selected?.id === s.id ? 'sel' : ''}`} onClick={() => startPreview(s)}>
+                <img src={s.thumbnailDataURL} />
+                <div className="caption">{s.name}</div>
+              </div>
+            ))}
+          </div>
+        )}
+      </section>
 
-      <div>
-        <strong>偵測到的視窗：</strong>
-        <ul>
-          {wins.map((w, i) => (
-            <li key={`${w.title}-${w.region.left}-${w.region.top}-${i}`}>
-              <button onClick={() => setSelected(w)}>
-                {w.title} — {w.region.width}×{w.region.height} @ ({w.region.left},{w.region.top})
-              </button>
-            </li>
-          ))}
-        </ul>
-      </div>
+      <section className="card">
+        <h2>視窗預覽與框選</h2>
+        <div ref={containerRef} className="preview" onMouseDown={onMouseDown} onMouseMove={onMouseMove} onMouseUp={onMouseUp}>
+          <video ref={videoRef} muted playsInline></video>
+          {(Math.abs(rect.w) > 3 && Math.abs(rect.h) > 3) && (
+            <div className="select" style={{
+              left: `${rect.w >= 0 ? rect.x : rect.x + rect.w}px`,
+              top: `${rect.h >= 0 ? rect.y : rect.y + rect.h}px`,
+              width: `${Math.abs(rect.w)}px`,
+              height: `${Math.abs(rect.h)}px`
+            }} />
+          )}
+        </div>
+        <div className="row gap">
+          <button onClick={captureAndOCR} disabled={!selected}>截圖 + 辨識</button>
+          <button onClick={testAutoClick}>自動點擊測試</button>
+        </div>
+      </section>
 
-      <div>
-        <button onClick={focusSelected}>🪄 聚焦選中的視窗</button>
-      </div>
-
-      <div>
-        <button onClick={chooseFolder}>📂 選擇儲存資料夾</button>
-        <div>目前儲存位置：{saveDir ?? '（尚未設定）'}</div>
-      </div>
-
-      <div>
-        <button onClick={captureSelected}>📸 擷取該視窗</button>
-        {shot && <div style={{ marginTop: 8 }}><img src={shot} alt="shot" style={{ maxWidth: 600, border: '1px solid #ddd' }} /></div>}
-      </div>
-
-      <div>
-        <textarea
-          value={expectedInput}
-          onChange={e => setExpectedInput(e.target.value)}
-          rows={8}
-          placeholder="在這裡貼你的名單，每行一個 ID"
-          style={{ width: '100%' }}
-        />
-      </div>
-
-      <div>
-        <button onClick={runOCR}>🔠 OCR（繁中+英）</button>
-        <pre style={{ whiteSpace: 'pre-wrap', background: '#f7f7f7', padding: 8 }}>{ocrText}</pre>
-      </div>
-
-      <div>
-        <h3>✔️ 有成功比對的 ID</h3>
-        <ul>{matched.map((id, i) => <li key={i}>{id}</li>)}</ul>
-
-        <h3>❌ 缺少的 ID（沒被擷取出來）</h3>
-        <ul>{notFound.map((id, i) => <li key={i}>{id}</li>)}</ul>
-
-        <h3>⚠️ 意外出現的 ID（未在清單內）</h3>
-        <ul>{unexpected.map((id, i) => <li key={i}>{id}</li>)}</ul>
-      </div>
+      <section className="card cols">
+        <div>
+          <h3>名單（每行一個）</h3>
+          <textarea value={namesText} onChange={e => setNamesText(e.target.value)} rows={10} />
+          <div className="row">
+            <label>相似度門檻：{threshold.toFixed(2)}</label>
+            <input type="range" min={0.5} max={0.95} step={0.01} value={threshold} onChange={e => setThreshold(Number(e.target.value))} />
+          </div>
+        </div>
+        <div>
+          <h3>OCR 結果</h3>
+          <pre className="ocr">{ocrText || '（尚未辨識）'}</pre>
+          <h3>比對命中</h3>
+          {matches.length === 0 ? (
+            <div>（尚無命中或未達門檻）</div>
+          ) : (
+            <table className="tbl">
+              <thead><tr><th>名單</th><th>辨識到</th><th>相似度</th></tr></thead>
+              <tbody>
+                {matches.map((m, i) => (
+                  <tr key={i}><td>{m.name}</td><td>{m.best}</td><td>{(m.score * 100).toFixed(1)}%</td></tr>
+                ))}
+              </tbody>
+            </table>
+          )}
+        </div>
+      </section>
     </div>
-  );
+  )
 }
