@@ -1,8 +1,11 @@
-const { app, BrowserWindow, ipcMain } = require('electron')
+// electron/main.js
+// ------------------------------------------------------------
+// 只做兩件事：建立視窗、提供「可擷取來源清單」給前端。
+// 不再使用 getDisplayMedia 系統選單，也不做系統視窗聚焦。
+// ------------------------------------------------------------
+const { app, BrowserWindow, ipcMain, desktopCapturer } = require('electron')
 const path = require('path')
-const { mouse, Point, straightTo, leftClick } = require('@nut-tree-fork/nut-js')
 
-const isDev = !!process.env.VITE_DEV_SERVER_URL
 let win
 
 function createWindow() {
@@ -12,22 +15,35 @@ function createWindow() {
     webPreferences: {
       contextIsolation: true,
       nodeIntegration: false,
-      preload: path.join(__dirname, 'preload.js'), // ★ 這行要對
+      sandbox: false,                              // 讓 preload 能 require('electron')
+      preload: path.join(__dirname, 'preload.js'), // 指向 electron/preload.js
     },
   })
 
-  if (isDev) {
-    win.loadURL(process.env.VITE_DEV_SERVER_URL) // e.g. http://localhost:5173
-    // win.webContents.openDevTools({ mode: 'detach' })
+  if (process.env.VITE_DEV_SERVER_URL) {
+    win.loadURL(process.env.VITE_DEV_SERVER_URL)
   } else {
-    win.loadFile(path.join(__dirname, '../dist/index.html')) // ★ 指向 dist
+    win.loadFile(path.join(__dirname, '../dist/index.html'))
   }
+  return win
 }
 
-app.whenReady().then(createWindow)
+app.whenReady().then(() => {
+  createWindow()
+})
+
 app.on('window-all-closed', () => { if (process.platform !== 'darwin') app.quit() })
 
-ipcMain.handle('automation:moveMouse', async (_e, x, y) => {
-  await mouse.move(straightTo(new Point(x, y)))
+// === IPC：列出可擷取的來源（視窗/螢幕） ===
+ipcMain.handle('capture:listSources', async () => {
+  const srcs = await desktopCapturer.getSources({
+    types: ['window', 'screen'],
+    fetchWindowIcons: true,
+    thumbnailSize: { width: 360, height: 220 },
+  })
+  return srcs.map(s => ({
+    id: s.id,
+    name: s.name,
+    thumbnailDataURL: s.thumbnail?.toDataURL() || '',
+  }))
 })
-ipcMain.handle('automation:click', async () => { await leftClick() })
